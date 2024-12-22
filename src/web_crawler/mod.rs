@@ -1,43 +1,53 @@
 use std::collections::VecDeque;
-use std::ops::{Deref, DerefMut};
 use reqwest::Error;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::mpsc::Sender;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::thread;
-use std::thread::JoinHandle;
-use crate::utils::thread_pool::ThreadPool;
 use crate::utils::Worker;
+use crate::filter_str_by;
+
+struct ActiveState {
+      reference: Arc<Mutex<bool>>,
+}
+
+impl ActiveState {
+      pub fn new(value: bool) -> Self {
+            Self {
+                  reference: Arc::new(Mutex::new(value)),
+            }
+      }
+
+      pub async fn is_active(&self) -> bool {
+            let value = *self.reference.lock().await;
+            value.clone()
+      }
+
+      pub async fn set_active(&self, value: bool) {
+            *self.reference.lock().await = value;
+      }
+}
+
+impl Clone for ActiveState {
+      fn clone(&self) -> Self {
+            Self {
+                  reference: self.reference.clone(),
+            }
+      }
+}
 
 pub struct WebCrawler {
       //proc_u: Arc<Mutex<ProcessingUnit>>,
       frontier: Arc<Mutex<CrawlerFrontier>>,
-      //handle: Option<JoinHandle<()>>,
-      //pool: Arc<Mutex<ThreadPool>>,
-      //stop_sender: Option<Sender<()>>,
       workers: Vec<Worker>,
-      active: Arc<Mutex<bool>>,
-
+      active_state: ActiveState,
 }
 
 impl WebCrawler {
       pub fn new(seeds: Vec<&str>) -> Self {
-            
-            let frontier = CrawlerFrontier::new(seeds.iter().map(|s| String::from(*s)).collect());
-            /* for seed in seeds {
-                  frontier.push(seed.into());
-            }; */
-
             Self {
                   //proc_u: Arc::new(Mutex::new(ProcessingUnit::new())),
-                  frontier: Arc::new(Mutex::new(frontier)),
-                  //handle: None,
-                  //pool: Arc::new(Mutex::new(ThreadPool::new(10))),
-                  //stop_sender: None,
+                  frontier: Arc::new(Mutex::new(CrawlerFrontier::from(seeds))),
                   workers: vec![],
-                  active: Arc::new(Mutex::new(false)),
+                  active_state: ActiveState::new(false),
             }
       }
 
@@ -48,58 +58,56 @@ impl WebCrawler {
             for i in 0..threads {
                   self.spawn_thread(i);
             }
-
-            /* let handle = thread::spawn(move || {
-                  while let Err(TryRecvError::Empty) = rx.try_recv() {
-                        if let Some(_link) = frontier.lock().unwrap().next() {
-                              let proc_u = proc_u.clone();
-                              pool.lock().unwrap().execute(move || {
-                                    // GET HTML
-                                    proc_u.lock().unwrap().push(String::from("page"));
-                              });     
-                        };
-                  }
-            }); */
-
-            //self.handle = Some(handle);
       }
 
-      pub async fn stop(&self) {
+      pub async fn stop(&mut self) {
             self.set_active(false).await;
-      
             //let _ = self.handle.take().unwrap().join();
       }
 
-      async fn set_active(&self, value: bool) {
-            *self.active.lock().await = value;
+      async fn set_active(&mut self, value: bool) {
+            self.active_state.set_active(value).await;
       }
 
       fn spawn_thread(&mut self, id: usize) {
             let frontier = self.frontier.clone();
-            let active = self.active.clone();
+            let active_state = self.active_state.clone();
+
             let worker = Worker::new(id.clone(), async move {
+
                   'a: loop {
-                        let mut frontier = frontier.lock().await;
-                        if !*active.lock().await {break;}
-                        let mut next = frontier.next();
-                        while next.is_none() {
-                              if !*active.lock().await {break 'a;}
-                              next = frontier.next();
-                        }
-                        let url = next.unwrap();
+
+                        if !active_state.is_active().await {break 'a;}
+                        let mut url = String::default();
+                        if let Err(_) = wait_next_url(&active_state, &mut url, &frontier).await {break 'a;}
+
                         println!("New value from frontier: {}, reading from thread {}", url, id.clone());
                         let page = fetch_page(url).await;
                         if page.is_err() {
                               println!("Error: {}", page.unwrap_err());
                         } else {
                               let page = page.unwrap();
-                              println!("{}", page);
+                              println!("{:#?}", filter_str_by!(&page,"href=\"{}\""));
                         }
                   }
             });
             self.workers.push(worker);
       }
 
+}
+
+
+
+async fn wait_next_url(active_state: &ActiveState,  url: &mut String, frontier: &Arc<Mutex<CrawlerFrontier>>) -> Result<(), ()> {
+      let mut frontier = frontier.lock().await;
+      loop {
+            if !active_state.is_active().await {return Err(());}
+
+            if let Some(t_url) = frontier.next() {
+                  *url=t_url;
+                  return Ok(());
+            }
+      }
 }
 
 
@@ -118,7 +126,6 @@ async fn fetch_page(url: String) -> Result<String,Error>{
       }
       Ok(page.unwrap())
 }
-
 
 
 
@@ -169,9 +176,9 @@ struct CrawlerFrontier {
 }
 
 impl CrawlerFrontier {
-      pub fn new(seeds: Vec<String>) -> Self {
+      pub fn new() -> Self {
             Self {
-                  queue: seeds.into(),
+                  queue: VecDeque::new(),
             }
       }
 
@@ -179,13 +186,23 @@ impl CrawlerFrontier {
             self.queue.push_back(link);
       }
 
-      pub async fn next_await(&mut self) -> String {
+      /* pub async fn next_await(&mut self) -> String {
             loop {
                   if let Some(value) = self.queue.pop_front() {return value;}
             }
-      }
+      } */
 
       pub fn next(&mut self) -> Option<String> {
             self.queue.pop_front()
+      }
+}
+
+impl From<Vec<&str>> for CrawlerFrontier {
+      fn from(value: Vec<&str>) -> Self {
+            let mut frontier = CrawlerFrontier::new();
+            for seed in value {
+                  frontier.push(String::from(seed));
+            }
+            frontier
       }
 }

@@ -7,7 +7,7 @@ async fn main() {
     let mut web_crawler = WebCrawler::new(vec![
         "https://google.com",
         "https://microsoft.com",
-        "https://facebook.com",
+        "https://projecteuler.net/",
     ]);
 
     web_crawler.start(5).await;
